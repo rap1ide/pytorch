@@ -339,9 +339,14 @@ if IS_WINDOWS:
         # so we first create the directory using mkdtemp and then remove it manually
         try:
             dir_name = tempfile.mkdtemp(suffix=suffix)
+            if dir_name is not None:
+                print("DEBUG: in TemporaryDirectoryName, dir_name: ", dir_name.encode(sys.stdout.encoding, errors='replace'))
+            else:
+                print("DEBUG: in TemporaryDirectoryName, dir_name is None")
             yield dir_name
         finally:
-            shutil.rmtree(dir_name)
+            pass
+            #shutil.rmtree(dir_name)
 else:
     @contextmanager  # noqa: T484
     def TemporaryDirectoryName(suffix=None):

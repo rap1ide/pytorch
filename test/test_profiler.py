@@ -24,6 +24,7 @@ except ImportError:
     HAS_PSUTIL = False
 import pickle
 
+import sys
 
 @unittest.skipIf(not HAS_PSUTIL, "Requires psutil to run")
 @unittest.skipIf(TEST_WITH_ASAN, "Cannot test with ASAN")
@@ -505,8 +506,13 @@ class TestProfiler(TestCase):
                     p.step()
 
             self.assertTrue(os.path.exists(dname))
+            if dname is not None:
+                print("DEBUG: dname = ", dname.encode(sys.stdout.encoding, errors='replace'))
+            else:
+                print("DEBUG: dname = None")
             file_num = 0
             for file_name in os.listdir(dname):
+                print("DEBUG:    file_name = ", file_name.encode(sys.stdout.encoding, errors='replace'))
                 parts = file_name.split('.')
                 self.assertTrue(len(parts) > 4)
                 self.assertTrue(parts[-4].isdigit() and int(parts[-4]) > 0, "Wrong tracing file name pattern")
