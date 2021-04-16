@@ -18,6 +18,7 @@
 #include <torch/csrc/jit/passes/bailout_graph.h>
 #include <torch/csrc/jit/runtime/exception_message.h>
 #include <torch/csrc/jit/runtime/graph_executor.h>
+#include <torch/csrc/jit/runtime/graph_iterator.h>
 #include <torch/csrc/jit/runtime/instruction.h>
 #include <torch/csrc/jit/runtime/jit_exception.h>
 #include <torch/csrc/jit/runtime/operator.h>
@@ -463,6 +464,7 @@ struct CodeImpl {
   size_t n_inputs;
   TypePtr return_type_;
   std::string function_name_;
+  bool from_mobile_;
 
   // We MUST hold onto graph here because some Operators stored in the
   // instruction lists have dependencies on meta-data stored in the graph
@@ -476,6 +478,18 @@ struct CodeImpl {
 
   // map from unique of nodes to register in register table
   std::unordered_map<Value*, int> value_to_reg_;
+
+  // map from operator name to trailing unnecessary inputs
+  // Example: for a schema of aten::foo.str
+  // aten::foo.str(arg0: str="default", arg1: int=0,
+  //               arg2: bool=False, arg3: float=0.0)
+  // If the usages in a graph is:
+  //    aten::foo("somestr", arg1=0, arg2=False, arg3=0.0)
+  //    aten::foo("somestr", arg1=1, arg2=False, arg3=0.0)
+  // op_to_num_unnecessary_args_["aten::foo.str"] = 2
+  // This is because for all usages, last two args are not used. (e.g. same
+  // value as default schema value)
+  std::unordered_map<std::string, int> op_to_num_unnecessary_args_;
 
   // running count of uses as we emit. When we reach use_count_[v] =
   // v.uses().size() we know it is the final use and we can move rather than
@@ -494,8 +508,10 @@ struct CodeImpl {
   CodeImpl(
       const std::shared_ptr<Graph>& graph,
       std::string function_name,
+      bool from_mobile,
       size_t remaining_bailout_depth)
       : function_name_(std::move(function_name)),
+        from_mobile_(from_mobile),
         preprocess_(*graph),
         current_node_(preprocess_.graph->return_node()),
         remaining_bailout_depth_(remaining_bailout_depth) {
@@ -508,7 +524,11 @@ struct CodeImpl {
           fmap(graph->outputs(), [](const Value* v) { return v->type(); }));
     }
     n_inputs = graph_->inputs().size();
-    // std::cout << *graph_ << "\n";
+    // TODO: for now, we do the calculation all the time
+    // if (from_mobile_) {
+    //   process_ops_for_mobile();
+    // }
+    process_ops_for_mobile();
     emitCodeForBlock(graph_->block());
     insertInstruction(RET);
     // we deferred the emission of bailout blocks so they appear at the end
@@ -518,6 +538,55 @@ struct CodeImpl {
 
   const std::vector<c10::IValue>& constant_table() const {
     return constant_table_;
+  }
+
+  void process_ops_for_mobile() {
+    DepthFirstGraphNodeIterator graph_it(graph_);
+    Node* node = graph_it.next();
+    while (node) {
+      if (node->maybeOperator()) {
+        auto op_schema = node->getOperator().schema();
+        auto numIgnore = calculate_trailing_unnecessary_args(
+            op_schema.arguments(), node->inputs(), op_schema.is_vararg());
+        auto unique_name = op_schema.overload_name() != ""
+            ? op_schema.name() + "." + op_schema.overload_name()
+            : op_schema.name();
+        auto it = op_to_num_unnecessary_args_.insert(
+            std::pair<std::string, int>(unique_name, INT_MAX));
+        auto prev_value = it.first->second;
+        it.first->second = std::min(numIgnore, prev_value);
+      }
+      node = graph_it.next();
+    }
+  }
+
+  int calculate_trailing_unnecessary_args(
+      std::vector<Argument> schema_args,
+      at::ArrayRef<Value*> actual_inputs,
+      bool is_vararg) {
+    if (is_vararg) {
+      AT_ASSERT(schema_args.size() <= actual_inputs.size());
+      return 0;
+    }
+
+    AT_ASSERT(schema_args.size() == actual_inputs.size());
+
+    // keeps track of trailing unnecessary args
+    int trail_count = 0;
+    for (size_t i = 0; i < schema_args.size(); i++) {
+      // this means it is not default argument, so it is necessary
+      if (!schema_args.at(i).default_value().has_value()) {
+        trail_count = 0;
+      } else {
+        auto schema_value = schema_args.at(i).default_value().value();
+        // non-const value will become nullptr here, so will be marked necessary
+        auto actual_value = toIValue(actual_inputs[i]);
+        // if the IR has same value as default value of the schema,
+        // it is not neccessary argument.
+        trail_count = (schema_value == actual_value) ? trail_count + 1 : 0;
+      }
+    }
+    return trail_count;
   }
 
   void request_bailout(size_t index) {
@@ -542,6 +611,11 @@ struct CodeImpl {
 
   const std::vector<Instruction>& instructions() const {
     return instructions_;
+  }
+
+  const std::unordered_map<std::string, int> op_to_num_unnecessary_args()
+      const {
+    return op_to_num_unnecessary_args_;
   }
 
   const std::vector<Node*>& instructions_source() const {
@@ -634,11 +708,36 @@ struct CodeImpl {
     }
   }
 
+  void emitLoadInputs(at::ArrayRef<Value*> inputs, int num_include) {
+    int count = 0;
+    for (Value* input : inputs) {
+      if (count < num_include) {
+        emitUse(input, false);
+        count++;
+      } else {
+        emitUse(input, true);
+      }
+    }
+  }
+
   void emitOperator(Node* node) {
-    emitLoadInputs(node->inputs());
     const Operator& op = node->getOperator();
+    auto unique_op_name = op.schema().overload_name() != ""
+        ? op.schema().name() + "." + op.schema().overload_name()
+        : op.schema().name();
+    auto min_ignore = 0;
+    // make sure we only do this for mobile code
+    if (from_mobile_ &&
+        op_to_num_unnecessary_args_.find(unique_op_name) !=
+            op_to_num_unnecessary_args_.end()) {
+      min_ignore = op_to_num_unnecessary_args_[unique_op_name];
+    }
+
+    auto necessary_size = node->inputs().size() - min_ignore;
+    emitLoadInputs(node->inputs(), necessary_size);
+
     if (op.hasOperation() && op.schema().is_vararg()) {
-      insertInstruction(OPN, operator_table_.size(), node->inputs().size());
+      insertInstruction(OPN, operator_table_.size(), necessary_size);
     } else {
       insertInstruction(OP, operator_table_.size());
     }
@@ -1733,10 +1832,12 @@ std::ostream& operator<<(std::ostream& out, const Code& code) {
 Code::Code(
     const std::shared_ptr<Graph>& graph,
     std::string function_name,
+    bool from_mobile,
     size_t remaining_bailout_depth)
     : pImpl(new CodeImpl(
           graph,
           std::move(function_name),
+          from_mobile,
           remaining_bailout_depth)) {}
 Code::~Code() = default;
 
@@ -1770,6 +1871,11 @@ const std::vector<c10::IValue>& Code::constant_table() const {
 
 const std::vector<Instruction>& Code::instructions() const {
   return pImpl->instructions();
+}
+
+const std::unordered_map<std::string, int> Code::op_to_num_unnecessary_args()
+    const {
+  return pImpl->op_to_num_unnecessary_args();
 }
 
 const std::vector<Node*>& Code::instructions_source() const {
