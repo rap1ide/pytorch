@@ -13,7 +13,7 @@ import inspect
 import copy
 import pickle
 import warnings
-from typing import Any, Dict
+from typing import Any, Dict, List, Tuple, Optional
 
 
 import torch
@@ -35,6 +35,14 @@ from torch.jit._state import (
 )
 from torch.overrides import (
     has_torch_function, has_torch_function_unary, has_torch_function_variadic)
+
+from torch.jit._monkeytype_config import (
+    monkeytype_trace,
+    JitTypeTraceConfig ,
+    JitTypeTraceStore
+)
+
+type_trace_db = JitTypeTraceStore()  # DB to hold all call traces from MonkeyType
 
 torch._C.ScriptMethod.graph_for = _graph_for  # type: ignore
 torch._C.ScriptFunction.graph_for = _graph_for  # type: ignore
@@ -840,7 +848,45 @@ def call_prepare_scriptable_func(obj):
     memo: Dict[int, torch.nn.Module] = {}
     return call_prepare_scriptable_func_impl(obj, memo)
 
-def script(obj, optimize=None, _frames_up: int = 0, _rcb=None):
+def _script_pdt(obj, optimize=None, _frames_up=0, _rcb=None, example_inputs: Optional[List[Tuple]] = None):
+    # This is a private API, intended for internal use only . Usage of this API is only for experimental
+    # purposes only and is highly discouraged to be used.
+    global type_trace_db
+    if not _enabled:
+        return obj
+
+    if optimize is not None:
+        warnings.warn(
+            "`optimize` is deprecated and has no effect. Use `with torch.jit.optimized_execution() instead"
+        )
+
+    # No-op for modules and functions that are already scripted
+    if isinstance(obj, ScriptModule):
+        return obj
+    if isinstance(obj, ScriptFunction):
+        return obj
+
+    if isinstance(obj, torch.nn.Module):
+        obj = call_prepare_scriptable_func(obj)
+        return torch.jit._recursive.create_script_module(
+            obj, torch.jit._recursive.infer_methods_to_compile
+        )
+
+    qualified_name = _qualified_name(obj)
+
+    # If MonkeyType is installed, enable profile directed type annotation
+    # Check if example_inputs are defined and generate call traces
+    # for the method by running eager mode version of the method with
+    # the provide example inputs. This logs all the traces in type_trace_db
+    type_trace_db = JitTypeTraceStore()
+    if monkeytype_trace:
+        monkeytype_config = JitTypeTraceConfig(type_trace_db)
+        with monkeytype_trace(monkeytype_config):
+            for example_input in example_inputs:  # type: ignore[union-attr]
+                obj(*example_input)
+    return script(obj, optimize, _frames_up, _rcb)
+
+def script(obj, optimize=None, _frames_up=0, _rcb=None):
     r"""
     Scripting a function or ``nn.Module`` will inspect the source code, compile
     it as TorchScript code using the TorchScript compiler, and return a :class:`ScriptModule` or
