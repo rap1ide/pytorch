@@ -47,6 +47,7 @@ from jit.test_jit_utils import TestJitUtils  # noqa: F401
 from jit.test_scriptmod_ann import TestScriptModuleInstanceAttributeTypeAnnotation  # noqa: F401
 from jit.test_types import TestTypesAndAnnotation  # noqa: F401
 from jit.test_misc import TestMisc  # noqa: F401
+from jit.test_pdt import TestPDT  # noqa: F401
 
 # Torch
 from torch import Tensor
@@ -286,7 +287,6 @@ def get_grad_executor(plan_state, diff_graph_idx=None, skip_check=False):
                 raise RuntimeError("Can't get a grad_executor for a non-differentiable graph")
     grad_executors = list(plan_state.code.grad_executor_states())
     return grad_executors[diff_graph_idx or 0]
-
 
 def all_backward_graphs(script_module, diff_graph_idx=None):
     # Note: for Python 2 the order seems to be unstable
@@ -12779,7 +12779,6 @@ dedent """
         # jank way to test if there is no error
         self.assertTrue(isinstance(f, torch.jit.ScriptModule))
         self.assertTrue(isinstance(f.call(), property))
-
 
     def test_pass(self):
         def foo(x):
